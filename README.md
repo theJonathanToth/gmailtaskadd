@@ -99,4 +99,4 @@ I created a new hook file in **.task/hooks**, ensured its name starts with "**on
 
 > Reminder: You can back up your task library by making a copy of the .task directory!
 
-Goto line 50 and update the filepath to your own credentials file.
+Goto line 24 and update the filepath to your own credentials file.
