@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+
+import base64
+import json
+import os.path
+import subprocess
+import time
+
+import http.client as httplib
+
+from bs4 import BeautifulSoup
+from datetime import timedelta
+from shlex import quote
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
+
+HOOKS_DIR = os.path.join(os.path.expanduser('~'), '.task', 'hooks')
+CREDENTIALS = os.path.join(HOOKS_DIR, 'client_secret_8675309-foryourowncredsforyourowncredscall.apps.googleusercontent.com.json')
+SETTINGS = os.path.join(HOOKS_DIR, 'settings.json')
+TOKEN = os.path.join(HOOKS_DIR, 'token.json')
+
+class NoNewTasksException(Exception): pass
+class NoInternetException(Exception): pass
+
+WAIT_TIME = timedelta(hours=1).total_seconds()
+
+
+# settings to help prevent my code from method-bombing itself, or from bugging google too often. they're busy. 
+def init_settings():
+    settings = {}
+    if os.path.exists(SETTINGS):
+        with open(SETTINGS, 'r') as f:
+            settings = json.load(f)
+        if settings.get('isrunning'):
+            return None
+        if time.time() - settings.get('prevtime', 0) < WAIT_TIME:
+            return None
+    settings['isrunning'] = 1        
+    with open(SETTINGS, 'w') as f:
+        json.dump(settings, f)
+    return settings
+
+# reset the settings for next time.
+def finalize(settings):
+    settings['prevtime'] = time.time()
+    settings['isrunning'] = 0
+    with open(SETTINGS, 'w') as f:
+        json.dump(settings, f)
+    
+# quicker than waiting for google's check to time out.
+def no_internet():
+    conn = httplib.HTTPSConnection('8.8.8.8', timeout=1)
+    try:
+        conn.request('HEAD', '/')
+        return False
+    except Exception:
+        return True
+    finally:
+        conn.close()
+
+# google stuff clogging up my main function.
+def get_credentials():
+    creds = None
+    if os.path.exists(TOKEN):
+        creds = Credentials.from_authorized_user_file(TOKEN, SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS, SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN, 'w') as token:
+            token.write(creds.to_json())
+    return creds
+
+# Are labelIds persistant? I just don't like asking for the same info everytime...
+def get_tasknotreadId(gmail, settings):
+    if 'tasknotread' not in settings:
+        labels = gmail.users().labels().list(userId='me').execute().get('labels', [])
+        for label in labels:
+            if label['name'] == 'tasknotread':
+                settings['tasknotread'] = label['id']
+    return settings['tasknotread']
+
+# Body data can be arbitrarily nested based on type of message.
+# (texts end up as 'inline', which seems to be the most deeply nested at 3 levels.)
+def get_body_data(parts):  
+    for part in parts:
+        if (part['mimeType']) in ('text/plain','text/html'):
+            return part['body']['data']
+        elif 'parts' in part:
+            return get_body_data(part['parts'])
+
+# I think this is specific to text message formatting, and may change even then.
+# I still don't understand the email message protocol. or bs4 for that matter.
+def get_task(decoded_data):
+    soup = BeautifulSoup(decoded_data, 'html.parser')
+    soup.body.unwrap()
+    soup.tr.unwrap()
+    lines = []
+    for chunk in soup.td:
+        paragraph = chunk.strip()
+        lines.extend(paragraph.splitlines())
+    return Task(lines)
+
+# I like classes.
+class Task():
+    def __init__(self, msg_lines):
+        self.tagtokens = []
+        self.project = ''
+        self.priority = ''
+        self.annotations = [quote(line) for line in msg_lines[1:]]
+
+        tokens = msg_lines[0].split()
+        for token in tokens:
+            if token.startswith('+'):
+                self.tagtokens.append(f'{quote(token)} ')
+                tokens.remove(token)
+
+            if token.startswith('pro:'):
+                self.project = f'{quote(token)} '
+                tokens.remove(token)
+
+            if token.startswith('pri:'):
+                uppertoken = token[:-1] + token[-1].upper()
+                self.priority = f'{quote(uppertoken)} '
+                tokens.remove(token)
+
+        self.tags = ''.join(self.tagtokens) if self.tagtokens else ''
+        self.description = f'{quote(" ".join(tokens))} '
+        self.entrytime = 'entry:1969-12-31T19:00:00'
+
+    def set_entrytime(self, internalDate):
+        local_time = time.localtime(float(internalDate)/1000)
+        self.entrytime = f'entry:{time.strftime("%Y-%m-%dT%H:%M:%S", local_time)}'
+
+    @property
+    def bash_script(self):
+        bash = [f'task add {self.description}{self.tags}{self.project}{self.priority}{self.entrytime}']
+        if self.annotations:
+            bash.append('ID=$(task +LATEST ids)')
+            for a in self.annotations:
+                bash.append(f'task $ID annotate {a}')
+        return '\n'.join(bash)
+
+
+###############################################################################
+# Main
+###############################################################################
+def main():
+    if not (settings := init_settings()):
+        return
+    try:
+        if no_internet():
+            raise NoInternetException
+
+        gmail = build('gmail', 'v1', credentials=get_credentials())
+        query = 'in:taskadd in:tasknotread'
+        resource = gmail.users().messages()
+        messageIds = resource.list(userId='me',q=query).execute().get('messages')
+
+        if not messageIds:
+            raise NoNewTasksException
+        
+        tasknotread = get_tasknotreadId(gmail, settings)
+
+        for msgId in messageIds:
+            msg = resource.get(userId='me', id=msgId['id']).execute()
+            data = get_body_data(msg['payload']['parts'])
+            decoded_data = base64.b64decode(data.replace('-','+').replace('_','/'))
+
+            task = get_task(decoded_data)
+            task.set_entrytime(msg['internalDate'])
+            subprocess.run(task.bash_script, shell=True)
+            
+            remove = {'removeLabelIds': [tasknotread, 'INBOX']}
+            resource.modify(userId='me', id=msgId['id'], body=remove).execute()
+
+    except HttpError as error:
+        print(f'An error occurred: {error}')
+    except NoNewTasksException as ohwell:
+        print('No new tasks from phone.')
+    except NoInternetException as sosad:
+        print('No internet connection.')
+
+    finalize(settings)
+
+
+
+
+def testing_bash():
+    print()
+    for txt in [
+        ['testing tags +tag +youreit'],
+        ['complex item pri:H pro:importantproject +doitnow', 'it has an annotation'],
+        ['pri:m easier typing in lowercase'],
+        ['mixing a few +chaotic things together proj:testing to see if it works pri:L']
+    ]:
+        print(Task(txt).bash_script)
+    print()
+
+
+if __name__ == '__main__':
+    main()
+    # testing_bash()
+
+
+
+# Done: Find out how to run a bash script from python (this will be running in linux subsystem as a taskwarrior hook)
+# Done: Filter by starred tasks, and remove star after reading. (Stars are funky apparently, using a second label instead.)
+# Done: Run this hook on taskwarrior startup (will require a specific name, "on-launch*.*")
+
+# Done: Why are prints repeating themselves?
+#         Because on-launch is being called everytime a new task is added or annotated.
+#           fixed multiple prints, but api may still be getting called.
+# Done: Check that limit_time applies within first call, and gmail api isn't being called each time.
+#           Could be as easy as running once, waiting 10 minutes, running again, checking charts for diff.
+#           Yep, chart exploded. try restricting main() by RUNTIME_GRACE
+#       Added 'isrunning' to settings, instead of trying to create a window of runtime.
+#       Switched from json bools to just 0 or 1. I was probably using it wrong.
+
+# Done: How can I protect against injection? check for ; char?
+#       shlex.quote protects against injection..? but messes with tags, projects, priority, ect.
+#         They are all lumped together into the description because of the shlex.quote around everything.
+#       I could tokenize the description, regex any starting with +, pro:, pri:
+#         then recombine the rest as description and then shlex.quote each of them seperately.
+
+# Done: Handle offline use. Is there an easy check for connectivity?
+
+# TODO: Leave an unfinished task as an example of how the others used to look.
